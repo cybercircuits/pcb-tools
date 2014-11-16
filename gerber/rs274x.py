@@ -26,7 +26,7 @@ from .gerber_statements import *
 from .primitives import *
 from .cam import CamFile, FileSettings
 
-def read(filename):
+def read(filename, bbox=None):
     """ Read data from filename and return a GerberFile
 
     Parameters
@@ -39,7 +39,7 @@ def read(filename):
     file : :class:`gerber.rs274x.GerberFile`
         A GerberFile created from the specified file.
     """
-    return GerberParser().parse(filename)
+    return GerberParser().parse(filename, bbox)
 
 
 class GerberFile(CamFile):
@@ -157,6 +157,13 @@ class GerberParser(object):
 
     REGION_MODE_STMT = re.compile(r'(?P<mode>G3[67])\*')
     QUAD_MODE_STMT = re.compile(r'(?P<mode>G7[45])\*')
+    
+    # Visibility constants used when clipping against a bounding box.
+    VIS_NONE = 0
+    VIS_START = 1
+    VIS_MIDDLE = 2
+    VIS_END = 3
+    VIS_ALL = 4
 
     def __init__(self):
         self.settings = FileSettings()
@@ -176,14 +183,13 @@ class GerberParser(object):
         self.quadrant_mode = 'multi-quadrant'
         self.step_and_repeat = (1, 1, 0, 0)
 
-
-    def parse(self, filename):
+    def parse(self, filename, bbox=None):
         fp = open(filename, "r")
         data = fp.readlines()
 
         for stmt in self._parse(data):
-            self.evaluate(stmt)
-            self.statements.append(stmt)
+            stmts = self.evaluate(stmt, bbox)
+            self.statements.extend(stmts)
 
         return GerberFile(self.statements, self.settings, self.primitives, filename)
 
@@ -314,7 +320,7 @@ class GerberParser(object):
 
             oldline = line
 
-    def evaluate(self, stmt):
+    def evaluate(self, stmt, bbox=None):
         """ Evaluate Gerber statement and update image accordingly.
 
         This method is called once for each statement in the file as it
@@ -327,19 +333,19 @@ class GerberParser(object):
 
         """
         if isinstance(stmt, CoordStmt):
-            self._evaluate_coord(stmt)
+            return self._evaluate_coord(stmt, bbox)
 
         elif isinstance(stmt, ParamStmt):
-            self._evaluate_param(stmt)
+            return self._evaluate_param(stmt)
 
         elif isinstance(stmt, ApertureStmt):
-            self._evaluate_aperture(stmt)
+            return self._evaluate_aperture(stmt)
 
         elif isinstance(stmt, (RegionModeStmt, QuadrantModeStmt)):
-            self._evaluate_mode(stmt)
+            return self._evaluate_mode(stmt)
 
         elif isinstance(stmt, (CommentStmt, UnknownStmt, EofStmt)):
-            return
+            return [stmt,]
 
         else:
             raise Exception("Invalid statement to evaluate")
@@ -360,6 +366,10 @@ class GerberParser(object):
             aperture = Obround(position=None, width=width, height=height)
         self.apertures[d] = aperture
 
+    def _evaluate_aperture(self, stmt):
+        self.aperture = stmt.d
+        return [stmt,]
+
     def _evaluate_mode(self, stmt):
         if stmt.type == 'RegionMode':
             if self.region_mode == 'on' and stmt.mode == 'off':
@@ -368,6 +378,7 @@ class GerberParser(object):
             self.region_mode = stmt.mode
         elif stmt.type == 'QuadrantMode':
             self.quadrant_mode = stmt.mode
+        return [stmt,]
 
     def _evaluate_param(self, stmt):
         if stmt.param == "FS":
@@ -382,8 +393,14 @@ class GerberParser(object):
             self.level_polarity = stmt.lp
         elif stmt.param == "AD":
             self._define_aperture(stmt.d, stmt.shape, stmt.modifiers)
+        return [stmt,]
 
-    def _evaluate_coord(self, stmt):
+    def _evaluate_coord(self, stmt, bbox=None):
+        stmts = [stmt,]
+
+        # import pprint
+        # pp = pprint.PrettyPrinter(indent=4)
+        
         x = self.x if stmt.x is None else stmt.x
         y = self.y if stmt.y is None else stmt.y
 
@@ -395,34 +412,110 @@ class GerberParser(object):
 
         if stmt.op == "D01":
             if self.region_mode == 'on':
-                if self.current_region is None:
-                    self.current_region = [(self.x, self.y), ]
-                self.current_region.append((x, y,))
+                if in_bbox((x,y), bbox):
+                    if self.current_region is None:
+                        self.current_region = [(self.x, self.y), ]
+                    self.current_region.append((x, y,))
+                else:
+                    stmts = []
             else:
                 start = (self.x, self.y)
                 end = (x, y)
                 width = self.apertures[self.aperture].stroke_width
                 if self.interpolation == 'linear':
                     self.primitives.append(Line(start, end, width, self.level_polarity))
+                    visibility, clipped_start, clipped_end = self.clip(start, end, bbox)
+                    new_startpoint_stmt = copy.deepcopy(stmt)
+                    new_startpoint_stmt.x = clipped_start[0]
+                    new_startpoint_stmt.y = clipped_start[1]
+                    new_startpoint_stmt.op = "D02"
+                    new_endpoint_stmt = copy.deepcopy(stmt)
+                    new_endpoint_stmt.x = clipped_end[0]
+                    new_endpoint_stmt.y = clipped_end[1]
+                    if visibility == self.VIS_ALL:
+                        pass 
+                    elif visibility == self.VIS_START:
+                        stmts = [new_endpoint_stmt,]
+                        # print('> ', stmt.to_gerber())
+                        # for s in stmts:
+                            # print('<< ', s.to_gerber())
+                    elif visibility == self.VIS_MIDDLE:
+                        stmts = [new_startpoint_stmt, new_endpoint_stmt,]
+                        # print('> ', stmt.to_gerber())
+                        # for s in stmts:
+                            # print('<< ', s.to_gerber())
+                    elif visibility == self.VIS_END:
+                        stmts = [new_startpoint_stmt, stmt,]
+                        # pp.pprint(clipped_start)
+                        # pp.pprint(clipped_end)
+                        # print('> ', stmt.to_gerber())
+                        # for s in stmts:
+                            # print('<< ', s.to_gerber())
+                    elif visibility == self.VIS_NONE:
+                        stmts = []
+                        # print('> ', stmt.to_gerber())
+                        # for s in stmts:
+                            # print('<< ', s.to_gerber())
+                    else:
+                        raise exception('Unknown visibility')
                 else:
                     center = (start[0] + stmt.i, start[1] + stmt.j)
                     self.primitives.append(Arc(start, end, center, self.direction, width, self.level_polarity))
 
         elif stmt.op == "D02":
-            pass
+            if not in_bbox((x,y), bbox):
+                stmts = []
 
         elif stmt.op == "D03":
+            if not in_bbox((x,y), bbox):
+                stmts = []
             primitive = copy.deepcopy(self.apertures[self.aperture])
             # XXX: temporary fix because there are no primitives for Macros and Polygon
             if primitive is not None:
                 primitive.position = (x, y)
                 primitive.level_polarity = self.level_polarity
                 self.primitives.append(primitive)
+
         self.x, self.y = x, y
+        return stmts
+        
+    def clip(self, start, end, bbox):
+        '''Return the endpoints of a segment of line from start to end that are visible within the given bbox.'''
+            
+        if bbox is None:
+            return self.VIS_ALL, start, end
+            
+        # Create a list containing the starting and ending points of the line and
+        # where the line crosses all the sides of the bounding box.
+        t = [0.0, 1.0]
+        t.append(solve_t(start, end, x=bbox[0][0])) # bbox left-side.
+        t.append(solve_t(start, end, x=bbox[0][1])) # bbox right-side.
+        t.append(solve_t(start, end, y=bbox[1][0])) # bbox bottom.
+        t.append(solve_t(start, end, y=bbox[1][1])) # bbox top.
+        t = [t_i for t_i in t if 0 <= t_i <= 1] # Remove points not between start and end.
+        assert(len(t) >= 2) # At least the start and end points must be in the list.
+        t.sort() # Sort the points in increasing distance from the starting point.
 
-    def _evaluate_aperture(self, stmt):
-        self.aperture = stmt.d
-
+        start_vis, end_vis = start, end
+        visibility = self.VIS_NONE
+        for i, t_i in list(enumerate(t))[:-1]:
+            if abs(t_i - t[i+1]) > 0.0001:
+                if in_bbox(solve_xy(start, end, t_i), bbox):
+                    if in_bbox(solve_xy(start, end, t[i+1]), bbox):
+                        start_vis = solve_xy(start, end, t_i)
+                        end_vis = solve_xy(start, end, t[i+1])
+                        if t_i < 0.0001:
+                            if t[i+1] > 1.0-0.0001:
+                                visibility = self.VIS_ALL
+                            else:
+                                visibility = self.VIS_START
+                        else:
+                            if t[i+1] > 1.0-0.0001:
+                                visibility = self.VIS_END
+                            else:
+                                visibility = self.VIS_MIDDLE
+                        break
+        return visibility, start_vis, end_vis
 
 def _match_one(expr, data):
     match = expr.match(data)
@@ -439,3 +532,37 @@ def _match_one_from_many(exprs, data):
             return (match.groupdict(), data[match.end(0):])
 
     return ({}, None)
+        
+def in_bbox(pt, bbox):
+    '''Return true if the given point is inside the given bounding box.'''
+    e = 0.000001 # Small value to fudge points near bbox boundary.
+    return (bbox is None) or (bbox[0][0]-e <= pt[0] <= bbox[0][1]+e and bbox[1][0]-e <= pt[1] <= bbox[1][1]+e)
+    
+def solve_t(start, end, x=None, y=None):
+    '''Find the fraction of the x or y along the line from start to end.'''
+    x0, y0 = start
+    x1, y1 = end
+    if x is not None:
+        try:
+            t = (x-x0)/float(x1-x0)
+        except:
+            t = None
+    elif y is not None:
+        try:
+            t = (y-y0)/float(y1-y0)
+        except:
+            t = None
+    else:
+        t = None
+    return t
+    
+def solve_xy(start, end, t):
+    '''Find the point (x,y) given the fraction along the line from start to end.'''
+    x0, y0 = start
+    x1, y1 = end
+    if t is not None:
+        x = x0 + t * (x1-x0)
+        y = y0 + t * (y1-y0)
+    else:
+        x, y = None, None
+    return x, y
