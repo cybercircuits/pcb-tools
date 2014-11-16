@@ -1,31 +1,20 @@
 pcb-tools
-============
-![Travis CI Build Status](https://travis-ci.org/curtacircuitos/pcb-tools.svg?branch=master) 
-[![Coverage Status](https://coveralls.io/repos/curtacircuitos/pcb-tools/badge.png?branch=master)](https://coveralls.io/r/curtacircuitos/pcb-tools?branch=master)
+====================================================================
 
-Tools to handle Gerber and Excellon files in Python.
+This is a fork of [pcb-tools](https://github.com/curtacircuitos/pcb-tools) modified to perform a single function:
+clip a Gerber layer against the bounding box of another layer. I have used
+this to clip silkscreen layers so they don't extend beyond the edges of the PCB
+(which can increase fabrication costs because the manufacturer thinks the board
+is larger than it actually is).
 
-Useage Example:
----------------
-    import gerber
-    from gerber.render import GerberSvgContext
+To clip a layer, use the following command:
 
-    # Read gerber and Excellon files
-    top_copper = gerber.read('example.GTL')
-    nc_drill = gerber.read('example.txt')
+    python clip.py -i silk.GTO -c board.GKO -o clipped_silk.GTO 
 
-    # Rendering context
-    ctx = GerberSvgContext()
+where:
 
-    # Create SVG image
-    top_copper.render(ctx)
-    nc_drill.render(ctx, 'composite.svg')
+* `silk.GTO` is the layer to be clipped (usually a silkscreen layer).
+* `board.GKO` is the layer whose bounding box will be used for clipping (usually the board outline).
+* `clipped_silk.GTO` is the resulting layer after the clipping operation.
 
-
-Rendering Examples:
--------------------
-###Top Composite rendering
-![Composite Top Image](examples/composite_top.png)
-
-###Bottom Composite rendering
-![Composite Bottom Image](examples/composite_bottom.png)
+This program has not been extensively tested. **Always check the result using a Gerber viewer!**
